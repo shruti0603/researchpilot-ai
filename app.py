@@ -147,7 +147,7 @@ tab1, tab2 = st.tabs(["Ask with citations", "Compare papers"])
 with tab1:
     q = st.text_input("Your question", placeholder="What retrieval method does the paper use?")
     if st.button("Ask") and q:
-        passages = retrieve(q, chunks, vecs)
+        passages = retrieve(q, chunks, vecs, k=8)
         with st.spinner("Generating grounded answer..."):
             ans = answer(q, passages)
             checks = verify(ans, passages)
