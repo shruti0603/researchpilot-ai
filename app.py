@@ -6,7 +6,7 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 import requests
 
 st.set_page_config(page_title="ResearchPilot AI", page_icon="🔬", layout="wide")
-LLM_ID = "llama-3.1-8b-instant"  # open-source Llama 3.1 served by Groq free API
+LLM_ID = "openai/gpt-oss-20b"  # open-weight model (Apache 2.0) served by Groq free API
 
 # ---------- demo login ----------
 if not st.session_state.get("ok"):
@@ -68,10 +68,12 @@ def answer(q, passages):
     r = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
         headers={"Authorization": f"Bearer {st.secrets['GROQ_API_KEY']}"},
-        json={"model": LLM_ID, "messages": msgs, "temperature": 0, "max_tokens": 300},
+        json={"model": LLM_ID, "messages": msgs, "temperature": 0, "max_tokens": 1200, "reasoning_effort": "low"},
         timeout=60,
     )
-    r.raise_for_status()
+    if not r.ok:
+        st.error(f"LLM API error {r.status_code}: {r.text[:300]}")
+        st.stop()
     return r.json()["choices"][0]["message"]["content"].strip()
 
 def verify(text, passages):
