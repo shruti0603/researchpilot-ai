@@ -76,15 +76,34 @@ def answer(q, passages):
         st.stop()
     return r.json()["choices"][0]["message"]["content"].strip()
 
+def windows(text, size=2):
+    sents = [x for x in re.split(r"(?<=[.!?])\s+", text) if len(x) > 20]
+    return [" ".join(sents[i:i + size]) for i in range(max(1, len(sents) - size + 1))] or [text]
+
+def probs(logits):
+    a = np.array(logits, dtype=float)
+    if a.min() >= 0 and np.allclose(a.sum(axis=1), 1, atol=1e-3):
+        return a
+    e = np.exp(a - a.max(axis=1, keepdims=True))
+    return e / e.sum(axis=1, keepdims=True)
+
 def verify(text, passages):
-    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if len(s.strip()) > 20]
+    """Label each claim: supported / partial / unsupported, with the best source passage."""
+    clean = re.sub(r"\[\d+\]|\*\*|[#*_`]", "", text)
+    claims = [re.sub(r"^\s*\d+\.\s*", "", c).strip() for c in re.split(r"(?<=[.!?])\s+|\n+", clean)]
+    claims = [c for c in claims if len(c) > 25]
+    cand = [(w, i) for i, (c, _) in enumerate(passages) for w in windows(c["text"])]
+    cv = emb.encode([w for w, _ in cand], normalize_embeddings=True)
     results = []
-    for s in sents:
-        pairs = [(c["text"], s) for c, _ in passages]
-        preds = np.array(nli.predict(pairs))
-        ent = int(np.argmax(preds, axis=1).tolist().count(1) > 0)
-        best = int(np.argmax([p[1] for p in preds])) if ent else None
-        results.append((s, bool(ent), best))
+    for claim in claims:
+        qv = emb.encode([claim], normalize_embeddings=True)[0]
+        sims = cv @ qv
+        top = np.argsort(-sims)[:3]
+        pr = probs(nli.predict([(cand[j][0], claim) for j in top]))  # cols: contradiction, entailment, neutral
+        k = int(np.argmax(pr[:, 1]))
+        ent, con, sim = pr[k, 1], pr[k, 0], float(sims[top[k]])
+        label = "supported" if ent >= 0.5 else "partial" if (sim >= 0.55 and con < 0.5) else "unsupported"
+        results.append((claim, label, cand[top[k]][1], float(ent)))
     return results
 
 # ---------- UI ----------
@@ -116,12 +135,17 @@ with tab1:
         st.subheader("Answer")
         st.write(ans)
         if checks:
-            pct = 100 * sum(ok for _, ok, _ in checks) / len(checks)
-            st.metric("Claims supported by sources", f"{pct:.0f}%")
+            n = len(checks)
+            sup = sum(l == "supported" for _, l, _, _ in checks)
+            par = sum(l == "partial" for _, l, _, _ in checks)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Fully supported", f"{100*sup/n:.0f}%")
+            c2.metric("Partially supported", f"{100*par/n:.0f}%")
+            c3.metric("Not supported", f"{100*(n-sup-par)/n:.0f}%")
             st.subheader("Claim verification")
-            for s, ok, best in checks:
-                src = f" → source [{best+1}]" if ok else ""
-                st.write(("✅ Supported" if ok else "⚠️ Not supported") + src + f": {s}")
+            icons = {"supported": "✅ Supported", "partial": "🟡 Partially supported", "unsupported": "⚠️ Not supported"}
+            for claim, label, src, ent in checks:
+                st.write(f"{icons[label]} (best source [{src+1}], entailment {ent:.2f}): {claim}")
         st.subheader("Evidence")
         for i, (c, sc) in enumerate(passages, 1):
             with st.expander(f"[{i}] {c['doc']} — page {c['page']} (similarity {sc:.2f})"):
