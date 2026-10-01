@@ -108,7 +108,7 @@ def windows(text, size=3):
 
 def verify(text, passages):
     """Label each claim: supported / partial / unsupported, with the best source passage."""
-    clean = re.sub(r"\[\d+\]|\*\*|[#*_`]", "", text)
+    clean = re.sub(r"\[\d+\]|【[^】]*】|\*\*|[#*_`]", "", text)
     claims = [re.sub(r"^\s*\d+\.\s*", "", c).strip() for c in re.split(r"(?<=[.!?])\s+|\n+", clean)]
     claims = [c for c in claims if len(c) > 25]
     cand = [(w, i) for i, (c, _) in enumerate(passages) for w in windows(c["text"])]
@@ -150,7 +150,8 @@ with tab1:
         passages = retrieve(q, chunks, vecs, k=8)
         with st.spinner("Generating grounded answer..."):
             ans = answer(q, passages)
-            checks = verify(ans, passages)
+            abstained = ans.lower().startswith("insufficient evidence")
+            checks = [] if abstained else verify(ans, passages)
         st.subheader("Answer")
         st.write(ans)
         if checks:
@@ -165,6 +166,8 @@ with tab1:
             icons = {"supported": "✅ Supported", "partial": "🟡 Partially supported", "unsupported": "⚠️ Not supported"}
             for claim, label, src, ent in checks:
                 st.write(f"{icons[label]} (best source [{src+1}], entailment {ent:.2f}): {claim}")
+        elif abstained:
+            st.info("No supporting evidence was found in the uploaded papers, so the system declined to answer instead of guessing.")
         st.subheader("Evidence")
         for i, (c, sc) in enumerate(passages, 1):
             with st.expander(f"[{i}] {c['doc']} — page {c['page']} (similarity {sc:.2f})"):
