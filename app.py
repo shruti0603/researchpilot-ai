@@ -2,8 +2,10 @@ import glob, os, re
 import fitz  # PyMuPDF
 import numpy as np
 import streamlit as st
-from sentence_transformers import CrossEncoder, SentenceTransformer
+from sentence_transformers import SentenceTransformer
 import requests
+import torch
+from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 st.set_page_config(page_title="ResearchPilot AI", page_icon="🔬", layout="wide")
 LLM_ID = "openai/gpt-oss-20b"  # open-weight model (Apache 2.0) served by Groq free API
@@ -23,13 +25,37 @@ if not st.session_state.get("ok"):
     st.stop()
 
 # ---------- models ----------
+NLI_MODELS = [
+    ("MoritzLaurer/DeBERTa-v3-base-mnli-fever-anli", None),  # stronger NLI; label ids read from model config
+    ("cross-encoder/nli-deberta-v3-small", (1, 0)),          # fallback: entailment=1, contradiction=0
+]
+
 @st.cache_resource(show_spinner="Loading open-source models (first run takes a few minutes)...")
 def load_models():
     emb = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    nli = CrossEncoder("cross-encoder/nli-deberta-v3-small")  # labels: contradiction, entailment, neutral
-    return emb, nli
+    for mid, fixed in NLI_MODELS:
+        try:
+            tok = AutoTokenizer.from_pretrained(mid)
+            mdl = AutoModelForSequenceClassification.from_pretrained(mid).eval()
+            lab = {str(v).lower(): int(k) for k, v in mdl.config.id2label.items()}
+            if "entailment" in lab and "contradiction" in lab:
+                return emb, (tok, mdl, lab["entailment"], lab["contradiction"], mid)
+            if fixed:
+                return emb, (tok, mdl, fixed[0], fixed[1], mid)
+        except Exception:
+            continue
+    raise RuntimeError("Could not load an NLI model")
 
 emb, nli = load_models()
+
+def nli_probs(pairs):
+    """pairs = [(premise, hypothesis)] -> (entailment_probs, contradiction_probs)"""
+    tok, mdl, ei, ci, _ = nli
+    enc = tok([p for p, _ in pairs], [h for _, h in pairs], truncation="only_first",
+              max_length=384, padding=True, return_tensors="pt")
+    with torch.no_grad():
+        pr = torch.softmax(mdl(**enc).logits, dim=-1).numpy()
+    return pr[:, ei], pr[:, ci]
 
 # ---------- ingestion ----------
 def chunk_pdf(name, data):
@@ -76,16 +102,9 @@ def answer(q, passages):
         st.stop()
     return r.json()["choices"][0]["message"]["content"].strip()
 
-def windows(text, size=2):
+def windows(text, size=3):
     sents = [x for x in re.split(r"(?<=[.!?])\s+", text) if len(x) > 20]
     return [" ".join(sents[i:i + size]) for i in range(max(1, len(sents) - size + 1))] or [text]
-
-def probs(logits):
-    a = np.array(logits, dtype=float)
-    if a.min() >= 0 and np.allclose(a.sum(axis=1), 1, atol=1e-3):
-        return a
-    e = np.exp(a - a.max(axis=1, keepdims=True))
-    return e / e.sum(axis=1, keepdims=True)
 
 def verify(text, passages):
     """Label each claim: supported / partial / unsupported, with the best source passage."""
@@ -98,10 +117,10 @@ def verify(text, passages):
     for claim in claims:
         qv = emb.encode([claim], normalize_embeddings=True)[0]
         sims = cv @ qv
-        top = np.argsort(-sims)[:3]
-        pr = probs(nli.predict([(cand[j][0], claim) for j in top]))  # cols: contradiction, entailment, neutral
-        k = int(np.argmax(pr[:, 1]))
-        ent, con, sim = pr[k, 1], pr[k, 0], float(sims[top[k]])
+        top = np.argsort(-sims)[:5]
+        ents, cons = nli_probs([(cand[j][0], claim) for j in top])
+        k = int(np.argmax(ents))
+        ent, con, sim = float(ents[k]), float(cons[k]), float(sims[top[k]])
         label = "supported" if ent >= 0.5 else "partial" if (sim >= 0.55 and con < 0.5) else "unsupported"
         results.append((claim, label, cand[top[k]][1], float(ent)))
     return results
@@ -162,8 +181,11 @@ with tab2:
         if st.button("Compare") and topic:
             pa = retrieve(topic, chunks, vecs, k=1, doc=a)[0][0]
             pb = retrieve(topic, chunks, vecs, k=1, doc=b)[0][0]
-            pred = np.array(nli.predict([(pa["text"], pb["text"])]))[0]
-            label = ["⚠️ Conflicting evidence", "✅ Supporting evidence", "ℹ️ Different or unrelated findings"][int(np.argmax(pred))]
+            e1, c1_ = nli_probs([(pa["text"], pb["text"])])
+            e2, c2_ = nli_probs([(pb["text"], pa["text"])])
+            ent, con = max(e1[0], e2[0]), max(c1_[0], c2_[0])
+            label = "⚠️ Conflicting evidence" if con > 0.5 else "✅ Supporting evidence" if ent > 0.5 else "ℹ️ Different or complementary findings"
+            st.caption(f"entailment {ent:.2f} · contradiction {con:.2f} · NLI model: {nli[4]}")
             st.subheader(label)
             c1, c2 = st.columns(2)
             c1.markdown(f"**{a}, p.{pa['page']}**"); c1.write(pa["text"])
